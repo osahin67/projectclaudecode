@@ -1,0 +1,17 @@
+[build-system]
+requires      = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name        = "drone-simulator"
+version     = "0.1.0"
+description = "Autonomous drone simulator with exploration, pathfinding, and fuel management"
+requires-python = ">=3.11"
+dependencies    = ["pygame>=2.6.0"]
+
+[project.scripts]
+drone-simulator = "run:run"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["drone*", "environment*", "memory*", "planner*", "visualization*"]

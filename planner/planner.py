@@ -1,50 +1,44 @@
 from __future__ import annotations
 from environment.grid import Position
 from drone.mode import Direction, DroneMode
+from memory.belief import BeliefState
 from memory.map import DroneMemory
 from .pathfinder import astar, CostProfile, BALANCED
 
 
-# Map (dx, dy) deltas back to Direction enum values for path → move conversion.
-_DELTA_TO_DIRECTION: dict[tuple[int,int], Direction] = {
+# Built once at import time — maps every (dx, dy) delta to its Direction.
+_DELTA_TO_DIRECTION: dict[tuple[int, int], Direction] = {
     (d.dx, d.dy): d for d in Direction
 }
-
-
-def _direction_to(frm: Position, to: Position) -> Direction | None:
-    delta = (to.x - frm.x, to.y - frm.y)
-    return _DELTA_TO_DIRECTION.get(delta)
 
 
 class Planner:
     """
     Converts the drone's current situation into a single Direction to move.
 
-    Owns the active goal and cached A* path.  Replans automatically when:
-      - the current goal has been reached
-      - no path exists yet
+    Owns the active goal and the cached A* path to it.  Replans when:
+      - the goal has been reached or is None
       - the mode changes (goal type changes)
+      - the next step on the cached path is now an obstacle
 
     Goal selection by mode
     ----------------------
-    EXPLORING  → closest frontier by Manhattan distance, navigated via A*
-    NAVIGATING → target_position from memory, navigated via A*
-    RETURNING  → base_position from memory, navigated via A*
+    EXPLORING  → closest frontier by Manhattan distance, routed via A*
+    NAVIGATING → memory.target_position, routed via A*
+    RETURNING  → memory.base_position, routed via A*
 
-    Why this avoids random wandering
-    ---------------------------------
-    The drone always has a concrete goal and follows the A* shortest path
-    toward it.  Exploration is systematic because frontiers are the
-    boundary of the known map — visiting any frontier is guaranteed to
-    expand knowledge.  The drone never moves randomly; every step is on
-    a path toward a chosen goal.
+    Systematic exploration
+    ----------------------
+    Frontiers are cells on the boundary between known and unknown space.
+    Moving toward the nearest frontier guarantees every step expands the
+    map — the drone cannot wander in circles on already-known ground.
     """
 
     def __init__(self, profile: CostProfile = BALANCED) -> None:
-        self._profile     = profile
-        self._goal:       Position | None       = None
-        self._path:       list[Position]        = []
-        self._last_mode:  DroneMode | None      = None
+        self._profile    = profile
+        self._goal:      Position | None  = None
+        self._path:      list[Position]   = []
+        self._last_mode: DroneMode | None = None
 
     # ------------------------------------------------------------------
     # Main interface
@@ -56,26 +50,19 @@ class Planner:
         mode: DroneMode,
         memory: DroneMemory,
     ) -> Direction | None:
-        """
-        Return the Direction the drone should move this tick, or None if
-        the drone is stuck (no reachable goal).
-        """
+        """Return the next Direction to move, or None if no goal is reachable."""
         if mode != self._last_mode:
             self._clear_plan()
             self._last_mode = mode
 
-        # If the current path is stale or exhausted, replan.
         if not self._path or position == self._goal:
             self._plan(position, mode, memory)
 
         if not self._path:
             return None
 
-        # Advance along the cached path.
         next_pos = self._path[0]
 
-        # If the next step is now an obstacle (newly discovered), replan.
-        from memory.belief import BeliefState
         if memory.get_belief(next_pos) == BeliefState.OBSTACLE:
             self._clear_plan()
             self._plan(position, mode, memory)
@@ -83,9 +70,8 @@ class Planner:
                 return None
             next_pos = self._path[0]
 
-        direction = _direction_to(position, next_pos)
+        direction = _DELTA_TO_DIRECTION.get((next_pos.x - position.x, next_pos.y - position.y))
         if direction is None:
-            # Path is broken (shouldn't happen, but be safe).
             self._clear_plan()
             return None
 
@@ -93,7 +79,7 @@ class Planner:
         return direction
 
     # ------------------------------------------------------------------
-    # Goal selection
+    # Planning
     # ------------------------------------------------------------------
 
     def _plan(self, position: Position, mode: DroneMode, memory: DroneMemory) -> None:
@@ -105,7 +91,6 @@ class Planner:
 
         path = astar(memory, position, goal, self._profile)
         if path is None:
-            # Goal unreachable — drop it so next tick tries a different one.
             self._goal = None
             self._path = []
         else:
@@ -118,34 +103,11 @@ class Planner:
         mode: DroneMode,
         memory: DroneMemory,
     ) -> Position | None:
-        if mode == DroneMode.NAVIGATING:
-            return memory.target_position
-
-        if mode == DroneMode.RETURNING:
-            return memory.base_position
-
-        if mode == DroneMode.EXPLORING:
-            return self._closest_frontier(position, memory)
-
-        return None
-
-    def _closest_frontier(
-        self,
-        position: Position,
-        memory: DroneMemory,
-    ) -> Position | None:
-        """
-        Pick the frontier cell nearest to the drone by Manhattan distance.
-
-        Manhattan distance is a cheap proxy — it avoids running A* to every
-        frontier on every tick while still pointing the drone toward nearby
-        unexplored space.  The actual path to the chosen frontier is still
-        computed with A*, so the route respects obstacles.
-        """
-        frontiers = memory.frontiers()
-        if not frontiers:
-            return None
-        return min(frontiers, key=lambda f: position.manhattan_distance(f))
+        match mode:
+            case DroneMode.NAVIGATING: return memory.target_position
+            case DroneMode.RETURNING:  return memory.base_position
+            case DroneMode.EXPLORING:  return _nearest_frontier(position, memory)
+            case _:                    return None
 
     # ------------------------------------------------------------------
 
@@ -156,3 +118,21 @@ class Planner:
     @property
     def current_goal(self) -> Position | None:
         return self._goal
+
+
+# ---------------------------------------------------------------------------
+# Frontier selection
+# ---------------------------------------------------------------------------
+
+def _nearest_frontier(position: Position, memory: DroneMemory) -> Position | None:
+    """
+    Return the frontier cell closest to position by Manhattan distance.
+
+    Manhattan is an O(1) proxy that avoids running A* to every frontier
+    on every tick.  The route to the chosen frontier is still computed with
+    A*, so it correctly routes around obstacles.
+    """
+    frontiers = memory.frontiers()
+    if not frontiers:
+        return None
+    return min(frontiers, key=lambda f: position.manhattan_distance(f))

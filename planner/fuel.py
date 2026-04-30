@@ -1,91 +1,87 @@
 from __future__ import annotations
+from constants import DIAGONAL_COST, CARDINAL_COST
 from environment.grid import Position
 from drone.drone import Drone
 from memory.map import DroneMemory
 from .pathfinder import CostProfile, astar
 
 
-# ------------------------------------------------------------------
-# Energy cost profile
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Energy-only cost profile
+# ---------------------------------------------------------------------------
 
-# For fuel estimation we use actual movement cost only — 1.0 per cardinal
-# step, √2 per diagonal — regardless of cell type.  Threat and unknown
-# penalties are planning deterrents, not fuel burns.  Using them here
-# would overestimate the energy needed to return and trigger early abort.
+# For fuel estimation we use only actual movement cost — 1.0 per cardinal
+# step, √2 per diagonal — ignoring cell type.  Threat and unknown penalties
+# are planning deterrents, not fuel burns.  Using them here would overstate
+# the return cost and trigger false-positive abort decisions.
 _ENERGY_PROFILE = CostProfile(
     clear=1.0, unknown=1.0, threat=1.0, target=1.0, base=1.0
 )
 
 
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Path cost helper
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def _path_cost(start: Position, path: list[Position]) -> float:
-    """Sum actual movement cost for a path (no cell-type weighting)."""
+    """
+    Sum actual movement cost for a path (no cell-type weighting).
+
+    Uses true step cost: DIAGONAL_COST for diagonal moves, CARDINAL_COST
+    for orthogonal moves — consistent with how Drone.move() spends energy.
+    """
     cost = 0.0
     prev = start
     for pos in path:
         diagonal = abs(pos.x - prev.x) == 1 and abs(pos.y - prev.y) == 1
-        cost += 1.414 if diagonal else 1.0
+        cost += DIAGONAL_COST if diagonal else CARDINAL_COST
         prev = pos
     return cost
 
 
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # FuelGuard
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 class FuelGuard:
     """
-    Decides whether the drone has enough fuel to continue its current
-    mission phase or must turn back immediately.
+    Decides whether the drone has enough fuel to continue its mission.
 
-    Why a fixed ratio threshold is wrong
-    -------------------------------------
-    A drone near the map edge needs ~N steps to reach base; one in the
-    centre needs ~N/2.  A fixed 30% threshold is simultaneously too
-    aggressive in some positions and too lax in others.  The guard
-    replaces it with an explicit cost estimate: compute the cheapest
-    physically possible path home, multiply by a safety margin, compare
-    to current fuel.
+    Why a fixed ratio is wrong
+    --------------------------
+    A drone near the map edge needs ~N steps home; one in the centre needs
+    ~N/2.  A fixed 30% threshold is too aggressive in some positions and
+    too lax in others.  FuelGuard replaces it with an explicit path-cost
+    estimate: compute the cheapest physically possible route home via A*,
+    multiply by a safety margin, compare to current fuel.
 
     Safety margin
     -------------
-    The estimate uses _ENERGY_PROFILE (all cell costs = 1.0), which gives
-    the minimum possible energy needed.  The margin covers:
+    _ENERGY_PROFILE gives the minimum possible cost (all cells = 1.0).
+    The margin of 1.3 covers:
       - newly discovered obstacles that invalidate the estimated path
-      - unknown cells that turn out to cost more than expected
-      - diagonal shortcuts that may not exist mid-flight
-    A margin of 1.3 means the drone starts home when it has 30% more
-    fuel than the cheapest known route requires.
+      - unknown cells that turn out to cost more than a clear step
+      - diagonal shortcuts that may not exist at execution time
 
     Base unknown
     ------------
-    If the drone has never observed base (first few steps), the guard
-    falls back to a conservative ratio threshold until base is discovered.
+    If the drone has not yet observed base, the guard falls back to a
+    conservative energy ratio until base is discovered.
     """
 
-    SAFETY_MARGIN      = 1.3
-    FALLBACK_THRESHOLD = 0.45   # used only before base is in memory
+    SAFETY_MARGIN:      float = 1.3
+    FALLBACK_THRESHOLD: float = 0.45
 
     # ------------------------------------------------------------------
 
     def must_return(self, drone: Drone, memory: DroneMemory) -> bool:
-        """
-        Return True if the drone must turn for home this tick.
-
-        Called every tick from MissionController.  When True, the
-        controller transitions to RETURNING regardless of current phase.
-        """
+        """Return True if the drone must head home this tick."""
         base = memory.base_position
         if base is None:
             return drone.energy_ratio < self.FALLBACK_THRESHOLD
 
         cost = self.return_cost(drone.position, base, memory)
         if cost is None:
-            # No path to base found in current memory — be very conservative.
             return drone.energy_ratio < self.FALLBACK_THRESHOLD
 
         return drone.energy <= cost * self.SAFETY_MARGIN
@@ -96,12 +92,11 @@ class FuelGuard:
         memory: DroneMemory,
     ) -> bool:
         """
-        Return True if the drone has enough fuel to reach the target AND
-        return to base afterward.
+        Return True if the drone has enough fuel to reach the known target
+        AND return to base afterward.
 
-        Called before EXPLORING → NAVIGATING transition.  If False, the
-        drone skips the target and returns home instead of getting stranded
-        mid-mission.
+        Called before EXPLORING → NAVIGATING.  If False, the drone skips
+        the target and returns directly rather than getting stranded.
         """
         target = memory.target_position
         base   = memory.base_position
@@ -115,8 +110,6 @@ class FuelGuard:
 
         cost_to_target = _path_cost(drone.position, path_to_target)
 
-        # If base is unknown, only check that we can reach the target.
-        # The controller will still guard the return leg via must_return().
         if base is None:
             return drone.energy >= cost_to_target * self.SAFETY_MARGIN
 
@@ -134,7 +127,7 @@ class FuelGuard:
         memory: DroneMemory,
     ) -> float | None:
         """
-        Estimate the minimum fuel needed to travel from position to base.
+        Minimum fuel needed to travel from position to base.
         Returns None if no path exists in current memory.
         """
         path = astar(memory, position, base, _ENERGY_PROFILE)

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from environment.grid import Position
 from memory.belief import BeliefState
 from memory.map import DroneMemory
+from constants import DIAGONAL_COST, CARDINAL_COST
 
 
 # ---------------------------------------------------------------------------
@@ -13,61 +14,51 @@ from memory.map import DroneMemory
 @dataclass(frozen=True)
 class CostProfile:
     """
-    Encodes the drone's risk tolerance as a set of per-cell traversal costs.
+    Encodes the drone's risk tolerance as per-cell traversal costs.
 
-    How to reason about a cost value
-    ---------------------------------
-    A cell with cost C is equivalent to C clear cells.  So a drone using
-    THREAT=15 will accept a detour of up to 14 extra clear-cell steps to
-    avoid one threat cell — any detour shorter than 14 steps is cheaper
-    than crossing the threat.
+    How to read a cost value
+    ------------------------
+    A cell with cost C is equivalent to C clear cells.  THREAT=15 means
+    the drone accepts a detour of up to 14 extra clear steps to avoid one
+    threat cell.  Any shorter detour is cheaper than crossing the threat.
 
-    Heuristic admissibility
-    -----------------------
-    A* is only guaranteed optimal when h(n) ≤ true_cost(n, goal).
-    The minimum possible step cost is 1.0 × clear (one cardinal step on a
-    clear cell).  As long as clear == 1.0 across all profiles, the raw
-    Chebyshev heuristic stays admissible without scaling.
+    Admissibility
+    -------------
+    A* is optimal only when h(n) ≤ true_cost(n, goal).  The minimum step
+    cost is CARDINAL_COST × clear == 1.0, so the raw Chebyshev heuristic
+    stays admissible for all profiles as long as clear == 1.0.
     """
-
-    # Cost to enter a cell of each belief state.
-    clear:    float = 1.0          # baseline — every other cost is relative to this
-    unknown:  float = 3.0          # prefer mapped routes; cross unknown only if needed
-    threat:   float = 15.0         # avoid strongly; accept ~14-step detour to skip one
-    target:   float = 1.0          # goal cell — free to enter
-    base:     float = 1.0          # home cell — free to enter
+    clear:    float = 1.0
+    unknown:  float = 3.0    # penalise unmapped space; cross it only if needed
+    threat:   float = 15.0   # strongly avoid; accept ~14-step detour per cell
+    target:   float = 1.0
+    base:     float = 1.0
 
     def for_belief(self, belief: BeliefState) -> float:
-        return {
-            BeliefState.CLEAR:    self.clear,
-            BeliefState.UNKNOWN:  self.unknown,
-            BeliefState.THREAT:   self.threat,
-            BeliefState.TARGET:   self.target,
-            BeliefState.BASE:     self.base,
-            BeliefState.OBSTACLE: float("inf"),
-        }[belief]
+        match belief:
+            case BeliefState.CLEAR:    return self.clear
+            case BeliefState.UNKNOWN:  return self.unknown
+            case BeliefState.THREAT:   return self.threat
+            case BeliefState.TARGET:   return self.target
+            case BeliefState.BASE:     return self.base
+            case BeliefState.OBSTACLE: return float("inf")
 
 
-# Preset profiles — passed into astar() or stored on the Planner.
-
-# Standard operation: avoids unknown and threat, not paranoid.
-BALANCED = CostProfile(unknown=3.0, threat=15.0)
-
-# Post-damage or low-energy: strongly prefers mapped, safe corridors.
-CAUTIOUS = CostProfile(unknown=6.0, threat=40.0)
-
-# Scout mode: treats unknown as nearly free, still avoids hard threats.
-AGGRESSIVE = CostProfile(unknown=1.2, threat=5.0)
+# Named presets — pass to Planner() or astar() to set drone risk tolerance.
+BALANCED   = CostProfile(unknown=3.0,  threat=15.0)
+CAUTIOUS   = CostProfile(unknown=6.0,  threat=40.0)
+AGGRESSIVE = CostProfile(unknown=1.2,  threat=5.0)
 
 
 # ---------------------------------------------------------------------------
 # Neighbour table
 # ---------------------------------------------------------------------------
 
-# (dx, dy, base_move_cost)  — diagonal costs √2 ≈ 1.414 more than cardinal.
 _NEIGHBORS: list[tuple[int, int, float]] = [
-    (-1,  0, 1.0), ( 1,  0, 1.0), ( 0, -1, 1.0), ( 0,  1, 1.0),
-    (-1, -1, 1.414), ( 1, -1, 1.414), (-1,  1, 1.414), ( 1,  1, 1.414),
+    (-1,  0, CARDINAL_COST), ( 1,  0, CARDINAL_COST),
+    ( 0, -1, CARDINAL_COST), ( 0,  1, CARDINAL_COST),
+    (-1, -1, DIAGONAL_COST), ( 1, -1, DIAGONAL_COST),
+    (-1,  1, DIAGONAL_COST), ( 1,  1, DIAGONAL_COST),
 ]
 
 
@@ -77,11 +68,8 @@ _NEIGHBORS: list[tuple[int, int, float]] = [
 
 def heuristic(a: Position, b: Position) -> float:
     """
-    Chebyshev distance — admissible for 8-directional movement when
-    clear == 1.0 (the minimum possible step cost).
-
-    Chebyshev is tighter than Manhattan for diagonal movement, which means
-    A* expands fewer nodes and runs faster.
+    Chebyshev distance — admissible for 8-directional movement.
+    Tighter than Manhattan for diagonal moves, so A* expands fewer nodes.
     """
     return float(max(abs(a.x - b.x), abs(a.y - b.y)))
 
@@ -97,40 +85,45 @@ def astar(
     profile: CostProfile = BALANCED,
 ) -> list[Position] | None:
     """
-    Find the lowest-cost path from start to goal on the drone's belief map.
+    Return the lowest-cost path from start to goal on the drone's belief map.
 
-    Returns the path as a list of Positions (start excluded, goal included),
-    or None if the goal is unreachable under the given profile.
+    Path is a list of Positions (start excluded, goal included), or None if
+    the goal is unreachable under the given profile.
 
     Cost model
     ----------
-    total_step_cost = base_move_cost × profile.for_belief(cell)
+    step_cost = base_move_cost × profile.for_belief(cell)
+    base_move_cost is CARDINAL_COST for orthogonal steps, DIAGONAL_COST for
+    diagonal steps.  Obstacles are always impassable.
 
-    base_move_cost is 1.0 for cardinal steps and √2 for diagonal steps.
-    profile.for_belief() maps belief state to a cost multiplier.
-    Obstacles are always impassable regardless of profile.
+    Lazy-deletion visited check
+    ---------------------------
+    Each heap entry stores the g-score at push time.  On pop, if the stored
+    g-score is higher than the best known g-score, the entry is stale
+    (a cheaper path was found later) and is skipped.  This avoids maintaining
+    a separate closed set while still guaranteeing each node is settled once.
     """
     if start == goal:
         return []
 
-    # (f_score, tie_breaker, position)
+    # Heap entries: (f_score, tie_breaker, g_at_push, position)
     counter = 0
-    heap: list[tuple[float, int, Position]] = []
-    heapq.heappush(heap, (0.0, counter, start))
+    heap: list[tuple[float, int, float, Position]] = []
+    heapq.heappush(heap, (heuristic(start, goal), counter, 0.0, start))
 
     g: dict[tuple[int, int], float] = {(start.x, start.y): 0.0}
     came_from: dict[tuple[int, int], Position] = {}
 
     while heap:
-        _, _, current = heapq.heappop(heap)
+        _, _, g_at_push, current = heapq.heappop(heap)
         ck = (current.x, current.y)
+
+        # Lazy deletion: skip if a cheaper route was found after this push.
+        if g_at_push > g.get(ck, float("inf")):
+            continue
 
         if current == goal:
             return _reconstruct(came_from, current)
-
-        # Skip if we already found a cheaper route to this node.
-        if g.get(ck, float("inf")) < g.get(ck, float("inf")):
-            continue
 
         for dx, dy, move_cost in _NEIGHBORS:
             nb = Position(current.x + dx, current.y + dy)
@@ -148,9 +141,10 @@ def astar(
                 g[nk] = tentative_g
                 came_from[nk] = current
                 counter += 1
-                heapq.heappush(heap, (tentative_g + heuristic(nb, goal), counter, nb))
+                f = tentative_g + heuristic(nb, goal)
+                heapq.heappush(heap, (f, counter, tentative_g, nb))
 
-    return None  # goal unreachable under this profile
+    return None
 
 
 # ---------------------------------------------------------------------------

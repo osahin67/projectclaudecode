@@ -1,28 +1,25 @@
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from constants import DIAGONAL_COST, CARDINAL_COST
 from environment.grid import Grid, Position
 from .mode import Direction, DroneMode
 
 
 @dataclass
 class MoveResult:
-    success: bool
+    success:  bool
     position: Position
-    reason: str = ""
+    reason:   str = ""
 
 
 class Drone:
     """
-    Represents the drone's physical state.
+    The drone's physical state.
 
-    Owns position, mode, energy, and movement history.
-    Has no knowledge of obstacles or the map — the Planner is
-    responsible for sending only valid move commands.
+    Owns position, mode, energy, heading, and movement history.
+    Has no knowledge of map contents — the Planner sends only valid moves
+    and is solely responsible for obstacle avoidance.
     """
-
-    # Energy consumed per step (cardinal vs diagonal)
-    _CARDINAL_COST  = 1.0
-    _DIAGONAL_COST  = 1.414  # ≈ √2
 
     def __init__(
         self,
@@ -30,21 +27,16 @@ class Drone:
         grid: Grid,
         max_energy: float = 200.0,
     ) -> None:
-        # position: where the drone currently is
-        self._position  = start
-        # grid: needed only for bounds checking on move; drone is not map-aware
-        self._grid      = grid
-        # mode: drives what the Planner should compute next
-        self._mode      = DroneMode.IDLE
-        # energy: finite resource; planner uses it to decide when to return
-        self._energy    = max_energy
+        if max_energy <= 0:
+            raise ValueError("max_energy must be positive")
+        self._position   = start
+        self._grid       = grid          # used only for in_bounds checks
+        self._mode       = DroneMode.IDLE
+        self._energy     = max_energy
         self._max_energy = max_energy
-        # heading: last direction moved; useful for sensor FOV later
-        self._heading: Direction | None = None
-        # history: ordered list of every position visited
-        self._history: list[Position] = [start]
-        # steps: total moves attempted (including failed ones)
-        self._steps     = 0
+        self._heading:   Direction | None      = None
+        self._history:   list[Position]        = [start]
+        self._steps      = 0
 
     # ------------------------------------------------------------------
     # Movement
@@ -52,33 +44,30 @@ class Drone:
 
     def move(self, direction: Direction) -> MoveResult:
         """
-        Attempt one step in `direction`.
-        Returns a MoveResult so the caller knows whether the move succeeded
-        without needing to compare positions before and after.
+        Attempt one step in direction.
+        Returns MoveResult so callers get structured feedback without
+        needing to compare positions before and after.
         """
         if self._mode == DroneMode.CRASHED:
             return MoveResult(False, self._position, "drone is crashed")
-
         if self._energy <= 0:
             return MoveResult(False, self._position, "out of energy")
 
-        candidate = Position(
-            self._position.x + direction.dx,
-            self._position.y + direction.dy,
-        )
+        candidate = Position(self._position.x + direction.dx,
+                             self._position.y + direction.dy)
 
         if not self._grid.in_bounds(candidate):
             self._steps += 1
             return MoveResult(False, self._position, "out of bounds")
 
-        cost = self._DIAGONAL_COST if direction.dx != 0 and direction.dy != 0 \
-               else self._CARDINAL_COST
+        cost = (DIAGONAL_COST if direction.dx != 0 and direction.dy != 0
+                else CARDINAL_COST)
 
-        self._position  = candidate
-        self._heading   = direction
-        self._energy    = max(0.0, self._energy - cost)
+        self._position = candidate
+        self._heading  = direction
+        self._energy   = max(0.0, self._energy - cost)
         self._history.append(candidate)
-        self._steps    += 1
+        self._steps   += 1
 
         return MoveResult(True, self._position)
 
@@ -92,11 +81,11 @@ class Drone:
         self._mode = mode
 
     def crash(self) -> None:
-        """Terminal state — called by the simulator when the drone hits an obstacle."""
+        """Terminal state — called by the simulator on obstacle collision."""
         self._mode = DroneMode.CRASHED
 
     # ------------------------------------------------------------------
-    # Read-only state (other modules read these, never write directly)
+    # Read-only state
     # ------------------------------------------------------------------
 
     @property
@@ -125,7 +114,7 @@ class Drone:
 
     @property
     def history(self) -> list[Position]:
-        return list(self._history)  # copy — callers cannot mutate internal history
+        return list(self._history)
 
     @property
     def is_alive(self) -> bool:
@@ -136,13 +125,12 @@ class Drone:
     # ------------------------------------------------------------------
 
     def status(self, return_cost: float | None = None) -> str:
-        fuel_str = ""
+        fuel = ""
         if return_cost is not None:
-            margin = self._energy - return_cost
-            fuel_str = f"  return≈{return_cost:.1f}  margin={margin:+.1f}"
+            fuel = f"  return≈{return_cost:.1f}  margin={self._energy - return_cost:+.1f}"
         return (
             f"pos=({self._position.x},{self._position.y})  "
             f"mode={self._mode.name:<11} "
             f"energy={self._energy:6.1f}/{self._max_energy:.0f}"
-            f"{fuel_str}  steps={self._steps}"
+            f"{fuel}  steps={self._steps}"
         )
