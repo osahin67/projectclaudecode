@@ -135,10 +135,14 @@ class Drone:
     # Debug
     # ------------------------------------------------------------------
 
-    def status(self) -> str:
+    def status(self, return_cost: float | None = None) -> str:
+        fuel_str = ""
+        if return_cost is not None:
+            margin = self._energy - return_cost
+            fuel_str = f"  return≈{return_cost:.1f}  margin={margin:+.1f}"
         return (
             f"pos=({self._position.x},{self._position.y})  "
             f"mode={self._mode.name:<11} "
-            f"energy={self._energy:6.1f}/{self._max_energy:.0f}  "
-            f"steps={self._steps}"
+            f"energy={self._energy:6.1f}/{self._max_energy:.0f}"
+            f"{fuel_str}  steps={self._steps}"
         )

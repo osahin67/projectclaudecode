@@ -1,44 +1,40 @@
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from drone.drone import Drone
 from drone.mode import DroneMode
 from memory.map import DroneMemory
-
-
-# The drone starts returning home when energy drops below this fraction,
-# regardless of whether it has found the target.  Set conservatively so the
-# drone can still reach base from anywhere on the map.
-_ENERGY_RETURN_THRESHOLD = 0.30
+from .fuel import FuelGuard
 
 
 @dataclass
 class MissionStatus:
-    complete: bool  = False
-    success:  bool  = False
-    reason:   str   = ""
+    complete: bool = False
+    success:  bool = False
+    reason:   str  = ""
 
 
 class MissionController:
     """
-    Top-level phase state machine.  Evaluates transition conditions every tick
-    and issues mode changes to the drone.
+    Top-level phase state machine.
 
     Transition table
     ----------------
     IDLE       → EXPLORING  : always, at first tick
-    EXPLORING  → NAVIGATING : target seen in memory
-    EXPLORING  → RETURNING  : energy below threshold (target never found)
-    NAVIGATING → RETURNING  : drone is standing on target cell
-    NAVIGATING → RETURNING  : energy below threshold mid-navigation
-    RETURNING  → complete   : drone is standing on base cell
+    EXPLORING  → NAVIGATING : target in memory AND FuelGuard confirms
+                              enough fuel to reach target + return to base
+    EXPLORING  → RETURNING  : FuelGuard says turn back now
+    NAVIGATING → RETURNING  : drone reached target cell
+    NAVIGATING → RETURNING  : FuelGuard says turn back now
+    RETURNING  → complete   : drone reached base cell
+    any        → failure    : drone is no longer alive (energy == 0)
 
-    The controller never touches the map or pathfinder — it only reads
-    high-level facts (mode, position, energy, what memory knows) and
-    issues set_mode() calls.  This keeps transitions legible and testable
-    in isolation.
+    The fuel check uses an actual A* path estimate (via FuelGuard) rather
+    than a fixed energy ratio.  This means the drone turns back based on
+    distance to base, not a blind percentage.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, fuel_guard: FuelGuard | None = None) -> None:
+        self._fuel   = fuel_guard or FuelGuard()
         self._status = MissionStatus()
 
     def tick(self, drone: Drone, memory: DroneMemory) -> MissionStatus:
@@ -53,23 +49,31 @@ class MissionController:
             drone.set_mode(DroneMode.EXPLORING)
             return self._status
 
-        # ── Terminal: energy exhausted before reaching base ──────────────
+        # ── Terminal: energy exhausted ───────────────────────────────────
         if not drone.is_alive:
             return self._finish(False, "out of energy before reaching base")
+
+        # ── Fuel check (runs every tick in active phases) ────────────────
+        # Check before phase-specific logic so an emergency return can
+        # override even a freshly triggered NAVIGATING transition.
+        if mode in (DroneMode.EXPLORING, DroneMode.NAVIGATING):
+            if self._fuel.must_return(drone, memory):
+                drone.set_mode(DroneMode.RETURNING)
+                return self._status
 
         # ── EXPLORING ───────────────────────────────────────────────────
         if mode == DroneMode.EXPLORING:
             if memory.target_position is not None:
-                drone.set_mode(DroneMode.NAVIGATING)
-            elif drone.energy_ratio < _ENERGY_RETURN_THRESHOLD:
-                drone.set_mode(DroneMode.RETURNING)
+                if self._fuel.can_reach_target_and_return(drone, memory):
+                    drone.set_mode(DroneMode.NAVIGATING)
+                else:
+                    # Target found but not enough fuel — head home.
+                    drone.set_mode(DroneMode.RETURNING)
 
         # ── NAVIGATING ──────────────────────────────────────────────────
         elif mode == DroneMode.NAVIGATING:
             target = memory.target_position
             if target and position == target:
-                drone.set_mode(DroneMode.RETURNING)
-            elif drone.energy_ratio < _ENERGY_RETURN_THRESHOLD:
                 drone.set_mode(DroneMode.RETURNING)
 
         # ── RETURNING ───────────────────────────────────────────────────
@@ -79,6 +83,8 @@ class MissionController:
                 return self._finish(True, "reached base")
 
         return self._status
+
+    # ------------------------------------------------------------------
 
     def _finish(self, success: bool, reason: str) -> MissionStatus:
         self._status.complete = True
