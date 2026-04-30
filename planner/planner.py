@@ -2,7 +2,7 @@ from __future__ import annotations
 from environment.grid import Position
 from drone.mode import Direction, DroneMode
 from memory.map import DroneMemory
-from .pathfinder import astar
+from .pathfinder import astar, CostProfile, BALANCED
 
 
 # Map (dx, dy) deltas back to Direction enum values for path → move conversion.
@@ -40,7 +40,8 @@ class Planner:
     a path toward a chosen goal.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, profile: CostProfile = BALANCED) -> None:
+        self._profile     = profile
         self._goal:       Position | None       = None
         self._path:       list[Position]        = []
         self._last_mode:  DroneMode | None      = None
@@ -102,7 +103,7 @@ class Planner:
             self._path = []
             return
 
-        path = astar(memory, position, goal)
+        path = astar(memory, position, goal, self._profile)
         if path is None:
             # Goal unreachable — drop it so next tick tries a different one.
             self._goal = None
